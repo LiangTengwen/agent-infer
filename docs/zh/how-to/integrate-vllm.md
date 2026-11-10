@@ -86,11 +86,22 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
       "decode_step_seconds_per_context_token": 2.2516e-7,
       "force_resume_timeout_scale": 3.0,
       "force_resume_timeout_min_seconds": 30,
-      "force_resume_timeout_max_seconds": 300
+      "force_resume_timeout_max_seconds": 300,
+      "queue_timeout_seconds": 120,
+      "admission_waiting_request_threshold": 0,
+      "max_active_programs_per_target": 64,
+      "capacity_repair_uses_observed_usage": true
     }
   }
 }'
 ```
+
+`queue_timeout_seconds` 是请求在 RequestPool 中的驻留上限，超时后运行时直接放行到 vLLM 原生等待队列
+（`progress_ttl_queue_timeout_fail_open`），避免饱和后端把一次调度决策变成无限客户端等待；`0` 关闭该上限，
+仅用于诊断。`admission_waiting_request_threshold` 是可选的后端等待队列计数闸，`0`（默认）关闭：引擎已经拥有自己的
+等待队列，再在前端扣留请求只会增加延迟。`max_active_programs_per_target` 限制单 rank 同时活跃的 Program 数，
+`0` 关闭。`capacity_repair_uses_observed_usage` 让容量修复优先使用引擎观测用量，避免因暂停只改账本而反复暂停。
+原生等待队列的 token 估计不再计入容量账本，只作为 `native_waiting_kv_tokens` 观测值保留。
 
 Prefill 和 Decode 系数与部署环境相关，应通过标定获得。请求首次进入等待状态时，Force-resume 会冻结
 deadline：用请求前方剩余轮数除以近期聚合请求吞吐，乘以 `force_resume_timeout_scale`，再限制到配置的

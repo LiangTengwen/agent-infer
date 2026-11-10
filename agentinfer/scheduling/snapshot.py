@@ -29,6 +29,7 @@ class SchedulingSnapshot:
         total_kv_tokens: Current GPU KV token capacity reported by that backend.
         native_used_kv_tokens: Optional vLLM block-pool use for native running reasoning requests observed by Adapter.
         native_waiting_kv_tokens: Optional logical token estimate for native vLLM waiting requests.
+        native_waiting_requests: Optional native vLLM waiting-request count used by the backend-waiting gate.
         request_pool_waiting_requests: Requests currently retained before downstream admission.
         programs: Scheduler-visible facts for all live programs.
         waiting_programs: Ordered program references in the program-level waiting pool.
@@ -41,6 +42,7 @@ class SchedulingSnapshot:
     waiting_programs: tuple[ProgramRef, ...]
     native_used_kv_tokens: int | None = None
     native_waiting_kv_tokens: int | None = None
+    native_waiting_requests: int | None = None
     request_pool_waiting_requests: int = 0
     _programs_by_ref: Mapping[ProgramRef, ProgramView] = field(init=False, repr=False, compare=False)
 
@@ -58,6 +60,8 @@ class SchedulingSnapshot:
             raise ValueError("snapshot native_used_kv_tokens must be non-negative")
         if self.native_waiting_kv_tokens is not None and self.native_waiting_kv_tokens < 0:
             raise ValueError("snapshot native_waiting_kv_tokens must be non-negative")
+        if self.native_waiting_requests is not None and self.native_waiting_requests < 0:
+            raise ValueError("snapshot native_waiting_requests must be non-negative")
         if self.request_pool_waiting_requests < 0:
             raise ValueError("snapshot request_pool_waiting_requests must be non-negative")
         if (

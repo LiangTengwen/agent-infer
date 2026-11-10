@@ -91,11 +91,25 @@ deployment-calibrated values and the work-ahead starvation bound introduced by t
       "decode_step_seconds_per_context_token": 2.2516e-7,
       "force_resume_timeout_scale": 3.0,
       "force_resume_timeout_min_seconds": 30,
-      "force_resume_timeout_max_seconds": 300
+      "force_resume_timeout_max_seconds": 300,
+      "queue_timeout_seconds": 120,
+      "admission_waiting_request_threshold": 0,
+      "max_active_programs_per_target": 64,
+      "capacity_repair_uses_observed_usage": true
     }
   }
 }'
 ```
+
+`queue_timeout_seconds` bounds how long a request may stay in the RequestPool; when it expires the runtime hands the
+request to native vLLM waiting (`progress_ttl_queue_timeout_fail_open`) so a saturated backend cannot turn a scheduling
+decision into an unbounded client wait. `0` disables the bound and is diagnostic only.
+`admission_waiting_request_threshold` is the optional backend-waiting count gate; `0` (the default) disables it because
+the backend already owns its waiting queue and retaining requests in front of it only adds latency.
+`max_active_programs_per_target` caps concurrently active Programs per rank (`0` disables it), and
+`capacity_repair_uses_observed_usage` makes capacity repair follow observed engine usage instead of a ledger that credits
+physical KV to a bookkeeping pause. Native waiting tokens are no longer charged against capacity; they remain available
+as the `native_waiting_kv_tokens` observation.
 
 The Prefill and Decode coefficients are deployment-specific and should be obtained by calibration. Force-resume now
 freezes a deadline when a request first waits: it divides the remaining rounds ahead of the request by recent

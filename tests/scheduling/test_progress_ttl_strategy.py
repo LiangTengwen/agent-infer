@@ -518,6 +518,7 @@ def test_force_resume_timeout_freezes_work_ahead_over_request_throughput(
             force_resume_timeout_scale=scale,
             force_resume_timeout_min_seconds=1,
             force_resume_timeout_max_seconds=1000,
+            admission_waiting_request_threshold=1,
         )
     )
     stats = components.initial_factors.global_factors
@@ -550,7 +551,7 @@ def test_force_resume_timeout_freezes_work_ahead_over_request_throughput(
     calls: list[TransitionRequest] = []
 
     outcome = components.strategy.handle_admission(
-        snapshot(active, ahead, candidate, waiting=(ahead.ref,)),
+        replace(snapshot(active, ahead, candidate, waiting=(ahead.ref,)), native_waiting_requests=1),
         components.initial_factors,
         controller(calls),
         candidate.ref,
@@ -558,6 +559,7 @@ def test_force_resume_timeout_freezes_work_ahead_over_request_throughput(
 
     factors = dict(components.initial_factors.program_factors)[candidate.ref]
     assert outcome.disposition is AdmissionDisposition.QUEUED
+    assert outcome.reason == "backend_waiting_gate"
     assert factors.force_resume_active_remaining_rounds == 3
     assert factors.force_resume_pool_remaining_rounds == 3
     assert factors.force_resume_request_throughput_per_second == pytest.approx(0.5)
@@ -569,7 +571,7 @@ def test_force_resume_timeout_freezes_work_ahead_over_request_throughput(
             sequence=1,
             kind=SchedulingEventKind.REQUEST_PENDING,
             occurred_at_monotonic_s=100,
-            reason="waiting_queue_precedence",
+            reason="backend_waiting_gate",
             program=candidate.ref,
         ),
         components.initial_factors,
@@ -1919,7 +1921,7 @@ def test_native_running_usage_is_combined_with_share_adjusted_acting_reservation
         waiting_programs=(),
     )
 
-    assert components.strategy._remaining_tokens(observed, 1.0) == -150
+    assert components.strategy._remaining_tokens(observed, 1.0) == 100
 
 
 def test_resume_order_prefers_the_most_recent_request_completion() -> None:

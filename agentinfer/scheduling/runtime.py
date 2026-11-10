@@ -76,10 +76,15 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         backend_pool_info: BackendPoolInfo,
         schedule_interval_seconds: float = 1.0,
         observability: SchedulerObservabilityConfig | None = None,
+        queue_timeout_seconds: float | None = None,
     ) -> None:
         backend, dp_rank = self._embedded_backend_rank(backend_pool_info)
         if not math.isfinite(schedule_interval_seconds) or schedule_interval_seconds <= 0:
             raise ValueError("schedule_interval_seconds must be finite and positive")
+        if queue_timeout_seconds is not None and (
+            not math.isfinite(queue_timeout_seconds) or queue_timeout_seconds < 0
+        ):
+            raise ValueError("queue_timeout_seconds must be finite and non-negative")
         self.strategy = strategy
         self.strategy_factors = strategy_factors
         self.backend_pool_info = backend_pool_info
@@ -93,6 +98,7 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         self._event_sequence = 0
         self._cycle_dirty = False
         self._schedule_interval_seconds = schedule_interval_seconds
+        self._queue_timeout_seconds = None if queue_timeout_seconds in (None, 0) else float(queue_timeout_seconds)
         self._observability = observability or SchedulerObservabilityConfig()
         self._next_observability_log_at_monotonic_s = 0.0
         self._next_periodic_check_at_monotonic_s = 0.0
@@ -235,7 +241,65 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                 outcome.deficit_tokens,
                 self.retained_request_count,
             )
+        if not admitted:
+            self._request_cycle_soon()
         return admitted
+
+    @property
+    def queue_timeout_seconds(self) -> float | None:
+        """Return the bounded retention limit, or ``None`` when retention is unbounded."""
+        return self._queue_timeout_seconds
+
+    def fail_open_expired_requests(self, now_monotonic_s: float | None = None) -> int:
+        """Admit retained requests that exceeded the bounded retention limit.
+
+        Retention is a policy optimization, never a correctness gate: once a request has waited longer than
+        ``queue_timeout_seconds`` the runtime hands it to the backend even if the capacity projection still reports a
+        deficit. Without this bound a saturated backend turns a scheduling decision into an unbounded client wait.
+        Returns the number of requests moved to the recent-admit list.
+        """
+        timeout = self._queue_timeout_seconds
+        if timeout is None:
+            return 0
+        now = time.monotonic() if now_monotonic_s is None else now_monotonic_s
+        if not math.isfinite(now) or now < 0:
+            raise ValueError("fail-open time must be finite and non-negative")
+        controller = TransitionController(self._apply_transition)
+        processed: list[str] = []
+        for entry in self.request_pool.entries:
+            if entry.status is not RequestPoolStatus.WAITING:
+                continue
+            if now - entry.arrived_at_monotonic_s < timeout:
+                continue
+            processed.append(entry.request_id)
+            binding = self._request_bindings.get(entry.request_id)
+            program = self.registry.get(binding.program) if binding is not None else None
+            if program is not None and program.state is ProgramState.PAUSED:
+                controller.admit(
+                    program.ref,
+                    reason="progress_ttl_queue_timeout_fail_open",
+                    backend_id=self._dispatch_target.backend_id,
+                )
+            self.request_pool.admit(entry.request_id, self._dispatch_target)
+        released = 0
+        for request_id in processed:
+            entry = self.request_pool.get(request_id)
+            if entry is None or entry.status is not RequestPoolStatus.ADMITTED:
+                continue
+            self._record_scheduler_admission(request_id, entry.arrived_at_monotonic_s)
+            released += 1
+        if released and self._observability.enabled:
+            logger.info(
+                "AgentInfer queue-timeout fail-open admitted=%d timeout_seconds=%.1f retained_requests=%d",
+                released,
+                timeout,
+                self.retained_request_count,
+            )
+        return released
+
+    def _request_cycle_soon(self) -> None:
+        """Make the next host poll run a scheduling cycle instead of waiting for the periodic deadline."""
+        self._next_periodic_check_at_monotonic_s = 0.0
 
     def schedule_cycle(self, backend_pool_info: BackendPoolInfo) -> None:
         """Run resume, capacity repair, and due TTL checks from fresh backend facts."""
@@ -424,6 +488,9 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                 TransitionController(self._apply_transition),
                 program.ref,
             )
+        # A completion frees capacity and may satisfy a retained request: re-evaluate on the next host poll instead of
+        # waiting for the periodic interval (event-driven wakeup).
+        self._request_cycle_soon()
 
     def on_response_completion(self, program_id: str, lifecycle: ProgramLifecycle) -> bool:
         """Apply an optional API-layer lifecycle fact after response semantic parsing.
@@ -595,6 +662,7 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             waiting_programs=waiting,
             native_used_kv_tokens=dp_rank.used_hbm_kv_tokens,
             native_waiting_kv_tokens=dp_rank.waiting_hbm_kv_tokens,
+            native_waiting_requests=dp_rank.waiting_requests,
             request_pool_waiting_requests=len(self.request_pool.waiting_request_ids),
         )
 

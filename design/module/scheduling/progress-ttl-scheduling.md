@@ -144,15 +144,18 @@ required_tokens(p) = private_tokens(p) + decode_buffer_tokens
 When native usage is available:
 
 ```text
-used_tokens = native_used_kv_tokens + active_acting_reserved_tokens + native_waiting_kv_tokens
+used_tokens = native_used_kv_tokens + active_acting_reserved_tokens
 ```
 
-`native_used_kv_tokens` covers active reasoning work already running in vLLM. `native_waiting_kv_tokens` covers full
-request contexts already admitted to native waiting and is intentionally not reduced by a shared-prefix estimate
-because native compute is already saturated when that queue exists. `active_acting_reserved_tokens` is the sum of
-`required_tokens(p)` for active acting Programs; this component subtracts each Program's observed shared prefix because
-only private retained KV is charged. Together the three terms approximate all active Program demand plus work already
-admitted to vLLM.
+`native_used_kv_tokens` covers active reasoning work already running in vLLM. `active_acting_reserved_tokens` is the
+sum of `required_tokens(p)` for active acting Programs; this component subtracts each Program's observed shared prefix
+because only private retained KV is charged.
+
+Native waiting demand is deliberately excluded from the capacity ledger even though the Adapter still reports it as
+`native_waiting_kv_tokens` (token estimate) and `native_waiting_requests` (count). The backend already owns that queue;
+charging its tokens makes a healthy backend look full and converts every arrival into a retention. The optional
+`admission_waiting_request_threshold` gate applies that demand as an admission precondition instead, and `0` disables
+it.
 
 If native usage is unavailable:
 
@@ -167,6 +170,10 @@ remaining_tokens(r) = floor(total_kv_tokens * r) - used_tokens
 ```
 
 Admission and resume use `resume_capacity_ratio`; repair uses `pause_capacity_ratio`.
+
+Capacity repair follows observed engine pressure when `capacity_repair_uses_observed_usage` is enabled and the Adapter
+reports `native_used_kv_tokens`: pausing an idle Program moves its context out of the ledger but frees no physical KV, so
+a repair decision taken from the ledger alone can pause Programs that the engine has room for.
 
 ## Continuous-growth reserve
 
@@ -211,15 +218,26 @@ Admission applies this order:
 
 1. an already active Program remains admitted;
 2. an eligible privileged relationship handoff may bypass ordinary waiting and capacity checks;
-3. an existing waiting Program, or any older waiting Program, keeps queue precedence;
-4. unknown capacity queues the candidate;
-5. if `remaining_tokens >= required_tokens + reserve_tokens`, admit;
-6. if immediate required capacity fits but reserve does not, admit only when batch gain covers recovery and lost continuity;
-7. otherwise queue.
+3. a candidate whose own Program already holds a pending request keeps per-Program FIFO precedence; another Program's
+   waiting request does not block it;
+4. the optional backend-waiting gate queues the candidate when `native_waiting_requests >=
+   admission_waiting_request_threshold` (disabled by default);
+5. the active-Program count guard queues the candidate when the rank already holds
+   `max_active_programs_per_target` active Programs (disabled when `0`);
+6. unknown capacity queues the candidate;
+7. if `remaining_tokens >= required_tokens + reserve_tokens`, admit;
+8. if immediate required capacity fits but reserve does not, admit only when batch gain covers recovery and lost continuity;
+9. otherwise queue.
+
+Retention is bounded by `queue_timeout_seconds`: a request retained longer than that is admitted directly to native
+waiting by the runtime (`progress_ttl_queue_timeout_fail_open`) regardless of the capacity projection, so a saturated
+backend cannot turn a scheduling decision into an unbounded client wait.
 
 Periodic resume considers only `PAUSED + REASONING` Programs. Resume candidates are partitioned into these tiers:
 
 1. **Forced:** the pending request reached its frozen adaptive force deadline; resume bypasses capacity projection.
+   Forced resume also bypasses the count guard but not the optional backend-waiting gate, which suppresses all resume
+   while the backend queue is above the configured threshold.
 2. **Privileged:** a bounded privileged Program resumes before ordinary candidates.
 3. **Ordinary:** order by `resume_order`; MRU favors the most recently completed Program and FCFS favors the oldest
    current request wait.

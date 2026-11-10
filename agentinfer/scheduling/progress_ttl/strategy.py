@@ -282,13 +282,23 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
                 required,
                 reserve,
             )
-        if snapshot.waiting_programs:
+        if self._backend_waiting_gate(snapshot):
             return self._queue(
                 snapshot,
                 strategy_factors,
                 transitions,
                 candidate,
-                "waiting_queue_precedence",
+                "backend_waiting_gate",
+                required,
+                reserve,
+            )
+        if self._active_program_limit_reached(snapshot):
+            return self._queue(
+                snapshot,
+                strategy_factors,
+                transitions,
+                candidate,
+                "active_program_limit",
                 required,
                 reserve,
             )
@@ -380,6 +390,8 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
                 )
             return
         self._reconcile_privileges(snapshot, strategy_factors)
+        if self._backend_waiting_gate(snapshot):
+            return
         remaining = self._remaining_tokens(snapshot, self.config.resume_capacity_ratio)
         active = self._active_programs(snapshot)
         waiting = [
@@ -443,6 +455,10 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
                 continue
             if remaining is None:
                 continue
+            if self.config.max_active_programs_per_target > 0 and len(active) >= (
+                self.config.max_active_programs_per_target
+            ):
+                break
             reserve = self._continuous_growth_reserve_tokens(tuple(active), strategy_factors, candidate=program)
             required_with_reserve = required + reserve
             if remaining < required_with_reserve:
@@ -512,7 +528,7 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
         self._promote_progress_privileges(snapshot, strategy_factors)
         all_active = self._active_programs(snapshot)
         active = [program for program in all_active if not program.marked_for_pause]
-        remaining = self._remaining_tokens(snapshot, self.config.pause_capacity_ratio)
+        remaining = self._repair_remaining_tokens(snapshot)
         required_headroom = self._capacity_repair_headroom_tokens(all_active, strategy_factors)
         future_pause_relief_tokens = sum(
             self._capacity_tokens(program) + self._expected_completion_tokens(strategy_factors)
@@ -1065,6 +1081,25 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
             if program.state is ProgramState.ACTIVE and program.backend_id == snapshot.backend_id
         ]
 
+    def _backend_waiting_gate(self, snapshot: SchedulingSnapshot) -> bool:
+        """Return whether the optional backend-waiting gate currently blocks ordinary admission.
+
+        The gate is a precondition, not a capacity charge: the backend already owns that waiting queue, so folding its
+        tokens into the capacity ledger would make a healthy backend look full and queue every arrival. ``0`` disables
+        the gate, which keeps the scheduler from inserting a second queue in front of a saturated engine.
+        """
+        threshold = self.config.admission_waiting_request_threshold
+        if threshold <= 0 or snapshot.native_waiting_requests is None:
+            return False
+        return snapshot.native_waiting_requests >= threshold
+
+    def _active_program_limit_reached(self, snapshot: SchedulingSnapshot) -> bool:
+        """Return whether the rank already holds the configured number of active Programs."""
+        limit = self.config.max_active_programs_per_target
+        if limit <= 0:
+            return False
+        return len(self._active_programs(snapshot)) >= limit
+
     def _privilege_enabled(self) -> bool:
         """Return whether bounded workflow privilege is available."""
         return True
@@ -1451,6 +1486,20 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
             )
         )
 
+    def _repair_remaining_tokens(self, snapshot: SchedulingSnapshot) -> int | None:
+        """Return free tokens for capacity repair, preferring observed engine pressure.
+
+        Pausing an idle Program frees no physical KV: the ledger stops charging it, the engine keeps its blocks cached.
+        Repair therefore follows the engine's own running-request usage when the adapter reports it, so a policy
+        projection inflated by idle Programs cannot trigger a pause loop that only churns Program state.
+        """
+        if self.config.capacity_repair_uses_observed_usage and snapshot.native_used_kv_tokens is not None:
+            if snapshot.total_kv_tokens is None:
+                return None
+            effective_capacity = int(snapshot.total_kv_tokens * self.config.pause_capacity_ratio)
+            return effective_capacity - snapshot.native_used_kv_tokens
+        return self._remaining_tokens(snapshot, self.config.pause_capacity_ratio)
+
     def _remaining_tokens(self, snapshot: SchedulingSnapshot, capacity_ratio: float) -> int | None:
         if snapshot.total_kv_tokens is None:
             return None
@@ -1469,7 +1518,7 @@ class ProgressTTLStrategy(SchedulingStrategy[ProgressTTLGlobalFactors, ProgressT
                 and program.status is ProgramStatus.ACTING
                 and program.backend_id == snapshot.backend_id
             )
-            used = snapshot.native_used_kv_tokens + acting_reserved + (snapshot.native_waiting_kv_tokens or 0)
+            used = snapshot.native_used_kv_tokens + acting_reserved
         return effective_capacity - used
 
     def _capacity_repair_headroom_tokens(

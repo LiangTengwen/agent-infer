@@ -91,6 +91,9 @@ class EmbeddedSchedulerController(Protocol[RetainedRequestT]):
     def cancel_request(self, request_id: str) -> RequestPoolEntry[RetainedRequestT] | None:
         """Remove and return a request retained before native admission."""
 
+    def fail_open_expired_requests(self, now_monotonic_s: float) -> int:
+        """Admit retained requests that exceeded the bounded retention limit and return how many moved."""
+
 
 class _VllmAdmissionHooks:
     """Composition helper shared by the two single-inheritance native bridges."""
@@ -156,15 +159,16 @@ class _VllmAdmissionHooks:
         self._drain_lifecycle_signals()
         now = time.monotonic()
         self.controller.run_due_lightweight_checks(now)
+        # Bounded retention first: a request that outlived ``queue_timeout_seconds`` must reach the backend even when
+        # the policy still projects a capacity deficit. This runs on every native poll, so the bound holds even when
+        # no scheduling cycle is due.
+        self.controller.fail_open_expired_requests(now)
         needs_cycle = self.controller.needs_schedule_cycle(now)
-        if not needs_cycle and not self._prefix_refresh_pending:
-            return
         if self._prefix_refresh_pending:
             self._observe_retained_prefix_cache(owner)
             self._prefix_refresh_pending = False
-        if not needs_cycle:
-            return
-        self.controller.schedule_cycle(self.backend_pool_info(owner))
+        if needs_cycle:
+            self.controller.schedule_cycle(self.backend_pool_info(owner))
         for entry, target in self.controller.consume_admitted_requests():
             if target != DispatchTarget(self.backend_id, self.dp_rank):
                 raise RuntimeError("embedded vLLM bridge received a target for another backend or DP rank")

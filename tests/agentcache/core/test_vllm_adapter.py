@@ -58,6 +58,9 @@ class _Controller:
     def run_due_lightweight_checks(self, now_monotonic_s) -> None:
         return None
 
+    def fail_open_expired_requests(self, now_monotonic_s) -> int:
+        return 0
+
     def consume_admitted_requests(self):
         return self.pool.consume_admitted()
 

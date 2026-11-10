@@ -54,6 +54,10 @@ _CONFIGURABLE_PROGRESS_TTL_SETTINGS = frozenset(
         "force_resume_timeout_min_seconds",
         "force_resume_timeout_max_seconds",
         "paused_program_ttl_seconds",
+        "queue_timeout_seconds",
+        "admission_waiting_request_threshold",
+        "max_active_programs_per_target",
+        "capacity_repair_uses_observed_usage",
     }
 )
 
@@ -224,6 +228,26 @@ def build_progress_ttl_controller(
             "paused_program_ttl_seconds",
             defaults.paused_program_ttl_seconds,
         ),
+        queue_timeout_seconds=_float_setting(
+            raw,
+            "queue_timeout_seconds",
+            defaults.queue_timeout_seconds,
+        ),
+        admission_waiting_request_threshold=_int_setting(
+            raw,
+            "admission_waiting_request_threshold",
+            defaults.admission_waiting_request_threshold,
+        ),
+        max_active_programs_per_target=_int_setting(
+            raw,
+            "max_active_programs_per_target",
+            defaults.max_active_programs_per_target,
+        ),
+        capacity_repair_uses_observed_usage=_bool_setting(
+            raw,
+            "capacity_repair_uses_observed_usage",
+            defaults.capacity_repair_uses_observed_usage,
+        ),
     )
     components = build_progress_ttl_strategy(config)
     observability_raw = settings.get("observability", {})
@@ -255,6 +279,7 @@ def build_progress_ttl_controller(
         backend_pool_info,
         schedule_interval_seconds=schedule_interval_seconds,
         observability=observability,
+        queue_timeout_seconds=config.queue_timeout_seconds,
     )
 
 

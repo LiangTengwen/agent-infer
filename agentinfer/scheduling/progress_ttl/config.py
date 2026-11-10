@@ -62,6 +62,21 @@ class ProgressTTLConfig:
     force_resume_timeout_min_seconds: float = 30.0
     force_resume_timeout_max_seconds: float = 300.0
     paused_program_ttl_seconds: float = 1800.0
+    # Bounded retention: a request retained before native admission waits at most this long; the runtime then admits
+    # it directly, so a saturated backend can never turn retention into an unbounded client wait. ``0`` disables the
+    # bound and restores unbounded retention, which is the behavior measured on 2026-11-09 (mean +17.7 s per request).
+    queue_timeout_seconds: float = 120.0
+    # Optional backend-waiting gate. The embedded adapter reports the native vLLM waiting-request count; when it
+    # reaches this threshold, ordinary admission and resume pause until the backend queue drains. ``0`` disables the
+    # gate, which is the default: a closed-loop agent workload cannot convert blocked admission into a larger batch,
+    # so the gate only inserts latency in front of a queue the engine already owns.
+    admission_waiting_request_threshold: int = 0
+    # Rank-local active Program count guard, mirroring the router reference ``max_active_programs_per_target``.
+    # ``0`` disables the guard.
+    max_active_programs_per_target: int = 64
+    # Prefer observed engine usage over the router ledger in capacity repair when the adapter reports it. Pausing an
+    # idle Program frees no physical KV, so repair must follow the engine's own pressure signal.
+    capacity_repair_uses_observed_usage: bool = True
 
     def __post_init__(self) -> None:
         """Reject values that make deadlines or capacity projections invalid."""
@@ -93,6 +108,22 @@ class ProgressTTLConfig:
         )
         if any(not math.isfinite(value) or value < 0 for value in finite_non_negative):
             raise ValueError("Progress-TTL time, cost, and weight values must be finite and non-negative")
+        if not math.isfinite(self.queue_timeout_seconds) or self.queue_timeout_seconds < 0:
+            raise ValueError("queue_timeout_seconds must be finite and non-negative")
+        if (
+            isinstance(self.admission_waiting_request_threshold, bool)
+            or not isinstance(self.admission_waiting_request_threshold, int)
+            or self.admission_waiting_request_threshold < 0
+        ):
+            raise ValueError("admission_waiting_request_threshold must be a non-negative integer")
+        if (
+            isinstance(self.max_active_programs_per_target, bool)
+            or not isinstance(self.max_active_programs_per_target, int)
+            or self.max_active_programs_per_target < 0
+        ):
+            raise ValueError("max_active_programs_per_target must be a non-negative integer")
+        if not isinstance(self.capacity_repair_uses_observed_usage, bool):
+            raise ValueError("capacity_repair_uses_observed_usage must be a boolean")
         if self.ttl_max_seconds < self.ttl_min_seconds:
             raise ValueError("ttl_max_seconds must be >= ttl_min_seconds")
         if self.shared_prefix_freshness_kv_turnovers <= 0:

@@ -35,6 +35,14 @@ a versioned section.
 
 ### Fixed
 
+- Progress-TTL no longer turns admission into an unbounded second queue. Native vLLM waiting tokens are excluded from
+  the capacity ledger (the optional `admission_waiting_request_threshold` gate applies that demand as a precondition and
+  defaults to `0`/disabled), retention is bounded by `queue_timeout_seconds` with a fail-open admit path
+  (`progress_ttl_queue_timeout_fail_open`), another Program's pending request no longer blocks a new Program, retained
+  requests are re-evaluated on the next host poll instead of the periodic tick, `max_active_programs_per_target` caps
+  concurrently active Programs per rank, and capacity repair prefers observed engine usage when
+  `capacity_repair_uses_observed_usage` is enabled. Together these address the 2026-11-09 SWE-bench A/B regression
+  where client-observed latency grew by 17.7 s per request while vLLM service time stayed flat.
 - When the vLLM metrics endpoint cannot be captured (for example a misconfigured `metrics_url` or an unreachable
   server), the `vllm` block in `summary.json` now reports the collector error in `reason`
   (`metrics_capture_failed: <error>`) instead of only the generic `missing_metrics_snapshot` placeholder. The change
